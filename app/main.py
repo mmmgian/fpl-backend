@@ -7,6 +7,8 @@ from pathlib import Path
 
 DB_PATH = Path("snapshots.db")
 
+# ---------- DB init ----------
+
 def init_db():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -27,8 +29,15 @@ def init_db():
 
 init_db()
 
+# ---------- App & CORS ----------
+
 app = FastAPI(title="FPL League API")
-origins = ["http://localhost:3000", "https://*.vercel.app"]
+
+# Adjust origins as needed; server-side fetches on Vercel won't need CORS
+origins = [
+    "http://localhost:3000",
+    "https://*.vercel.app",
+]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -37,11 +46,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CACHE_TTL = 60
+# ---------- Caching ----------
+
+CACHE_TTL = 60  # seconds
 _cache = {}
 
+# ---------- Helpers to call FPL ----------
+
 async def fetch_fpl_classic(league_id: int, page: int = 1):
-    url = f"https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/?page_standings={page}&per_page=50"
+    url = (
+        f"https://fantasy.premierleague.com/api/leagues-classic/"
+        f"{league_id}/standings/?page_standings={page}&per_page=50"
+    )
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(url)
         r.raise_for_status()
@@ -60,6 +76,29 @@ async def fetch_all_standings(league_id: int):
             break
         page += 1
     return combined or {}
+
+async def current_gw():
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get("https://fantasy.premierleague.com/api/bootstrap-static/")
+        r.raise_for_status()
+        data = r.json()
+        events = data.get("events", [])
+        curr = next((e for e in events if e.get("is_current")), None)
+        if not curr:
+            curr = max(
+                (e for e in events if e.get("finished")),
+                key=lambda e: e["id"],
+                default=None,
+            )
+        return curr["id"] if curr else None
+
+async def fetch_event_status():
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get("https://fantasy.premierleague.com/api/event-status/")
+        r.raise_for_status()
+        return r.json()
+
+# ---------- Routes ----------
 
 @app.get("/health")
 async def health():
@@ -82,17 +121,6 @@ async def get_league(league_id: int):
     _cache[key] = (now, raw)
     return raw
 
-async def current_gw():
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get("https://fantasy.premierleague.com/api/bootstrap-static/")
-        r.raise_for_status()
-        data = r.json()
-        events = data.get("events", [])
-        curr = next((e for e in events if e.get("is_current")), None)
-        if not curr:
-            curr = max((e for e in events if e.get("finished")), key=lambda e: e["id"], default=None)
-        return curr["id"] if curr else None
-
 @app.post("/snapshot/{league_id}")
 async def snapshot_league(league_id: int, gw: Optional[int] = None):
     try:
@@ -112,11 +140,44 @@ async def snapshot_league(league_id: int, gw: Optional[int] = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/autosnapshot/{league_id}")
+async def autosnapshot(league_id: int):
+    """
+    Use FPL event-status to snapshot only when the current GW has settled (bonus added / leagues updated).
+    Safe to call repeatedly; DB UNIQUE(league_id, gw) prevents duplicates.
+    """
+    try:
+        status = await fetch_event_status()
+        s = (status.get("status") or [{}])[0]
+        gw = s.get("event")
+        bonus_done = bool(s.get("bonus_added"))
+        if not gw:
+            raise HTTPException(status_code=503, detail="Could not determine current GW from event-status")
+        if not bonus_done:
+            return {"ok": False, "reason": "GW not settled yet", "gw": gw, "bonus_added": bonus_done}
+        data = await fetch_all_standings(league_id)
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO league_snapshots (league_id, gw, taken_at, data) VALUES (?, ?, ?, ?)",
+            (league_id, gw, datetime.utcnow().isoformat(), json.dumps(data)),
+        )
+        con.commit()
+        con.close()
+        return {"ok": True, "snapshotted": True, "gw": gw, "bonus_added": bonus_done}
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/history/{league_id}")
 async def list_history(league_id: int):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("SELECT gw, taken_at FROM league_snapshots WHERE league_id=? ORDER BY gw", (league_id,))
+    cur.execute(
+        "SELECT gw, taken_at FROM league_snapshots WHERE league_id=? ORDER BY gw",
+        (league_id,),
+    )
     rows = [{"gw": gw, "taken_at": taken_at} for gw, taken_at in cur.fetchall()]
     con.close()
     return {"league_id": league_id, "snapshots": rows}
@@ -125,7 +186,10 @@ async def list_history(league_id: int):
 async def get_snapshot(league_id: int, gw: int):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("SELECT data FROM league_snapshots WHERE league_id=? AND gw=?", (league_id, gw))
+    cur.execute(
+        "SELECT data FROM league_snapshots WHERE league_id=? AND gw=?",
+        (league_id, gw),
+    )
     row = cur.fetchone()
     con.close()
     if not row:
