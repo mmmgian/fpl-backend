@@ -96,9 +96,10 @@ async def fetch_entry_picks(entry_id: int, gw: int):
 
 # ---------- Routes ----------
 
+# --- Health check ---
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"status": "ok"}
 
 @app.get("/league/{league_id}")
 async def get_league(league_id: int):
@@ -146,25 +147,46 @@ async def autosnapshot(league_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# --- History: all GWs for a league ---
 @app.get("/history/{league_id}")
-async def list_history(league_id: int):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT gw, taken_at FROM league_snapshots WHERE league_id=? ORDER BY gw", (league_id,))
-    rows = [{"gw": gw, "taken_at": taken} for gw, taken in cur.fetchall()]
-    con.close()
-    return {"league_id": league_id, "snapshots": rows}
+async def get_history(league_id: int):
+    try:
+        conn = sqlite3.connect("snapshots.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT gw, data FROM snapshots WHERE league_id = ? ORDER BY gw ASC", (league_id,))
+        rows = cursor.fetchall()
+        conn.close()
 
+        if not rows:
+            return {"history": []}
+
+        history = []
+        for gw, data in rows:
+            history.append({
+                "gw": gw,
+                "data": json.loads(data)
+            })
+
+        return {"history": history}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- History: specific GW ---
 @app.get("/history/{league_id}/{gw}")
-async def get_snapshot(league_id: int, gw: int):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT data FROM league_snapshots WHERE league_id=? AND gw=?", (league_id, gw))
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        raise HTTPException(status_code=404, detail="Snapshot not found")
-    return json.loads(row[0])
+async def get_history_gw(league_id: int, gw: int):
+    try:
+        conn = sqlite3.connect("snapshots.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT data FROM snapshots WHERE league_id = ? AND gw = ?", (league_id, gw))
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="No snapshot found for that GW")
+
+        return {"gw": gw, "data": json.loads(row[0])}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/team/{entry_id}")
 async def get_team(entry_id: int):
