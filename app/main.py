@@ -1,14 +1,12 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
-import httpx, time, sqlite3, json
+import httpx, sqlite3, json, asyncio, random, time
 from datetime import datetime
 from pathlib import Path
 
 DB_PATH = Path("snapshots.db")
 
 # ---------- DB init ----------
-
 def init_db():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -30,44 +28,59 @@ def init_db():
 init_db()
 
 # ---------- App & CORS ----------
-
 app = FastAPI(title="FPL League API")
-
-# Adjust origins as needed; server-side fetches on Vercel won't need CORS
-origins = [
-    "http://localhost:3000",
-    "https://*.vercel.app",
-]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Caching ----------
+# ---------- Helpers ----------
+HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=None)
 
-CACHE_TTL = 60  # seconds
-_cache = {}
+async def _get_json(url: str, timeout: httpx.Timeout = HTTP_TIMEOUT, attempts: int = 2):
+    last_err = None
+    for i in range(attempts):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                return r.json()
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(0.05 + random.random() * 0.1)
+    raise last_err
 
-# ---------- Helpers to call FPL ----------
+async def fetch_event_status():
+    return await _get_json("https://fantasy.premierleague.com/api/event-status/")
+
+async def fetch_bootstrap():
+    return await _get_json("https://fantasy.premierleague.com/api/bootstrap-static/")
+
+async def fetch_fixtures_for_gw(gw: int):
+    all_fix = await _get_json("https://fantasy.premierleague.com/api/fixtures/")
+    return [f for f in all_fix if f.get("event") == gw]
+
+def fixtures_all_finished(fixtures: list) -> bool:
+    if not fixtures:
+        return False
+    for f in fixtures:
+        if not f.get("finished"):
+            return False
+        if "finished_provisional" in f and not f.get("finished_provisional"):
+            return False
+    return True
 
 async def fetch_fpl_classic(league_id: int, page: int = 1):
-    url = (
-        f"https://fantasy.premierleague.com/api/leagues-classic/"
-        f"{league_id}/standings/?page_standings={page}&per_page=50"
-    )
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        return r.json()
+    url = f"https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/?page_standings={page}&per_page=50"
+    return await _get_json(url)
 
 async def fetch_all_standings(league_id: int):
-    page = 1
-    combined = None
+    page, combined = 1, None
     while True:
-        chunk = await fetch_fpl_classic(league_id, page=page)
+        chunk = await fetch_fpl_classic(league_id, page)
         if combined is None:
             combined = chunk
         else:
@@ -77,27 +90,6 @@ async def fetch_all_standings(league_id: int):
         page += 1
     return combined or {}
 
-async def current_gw():
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get("https://fantasy.premierleague.com/api/bootstrap-static/")
-        r.raise_for_status()
-        data = r.json()
-        events = data.get("events", [])
-        curr = next((e for e in events if e.get("is_current")), None)
-        if not curr:
-            curr = max(
-                (e for e in events if e.get("finished")),
-                key=lambda e: e["id"],
-                default=None,
-            )
-        return curr["id"] if curr else None
-
-async def fetch_event_status():
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get("https://fantasy.premierleague.com/api/event-status/")
-        r.raise_for_status()
-        return r.json()
-
 # ---------- Routes ----------
 
 @app.get("/health")
@@ -106,65 +98,45 @@ async def health():
 
 @app.get("/league/{league_id}")
 async def get_league(league_id: int):
-    now = time.time()
-    key = ("classic", league_id)
-    if key in _cache:
-        cached_at, data = _cache[key]
-        if now - cached_at < CACHE_TTL:
-            return data
-    try:
-        raw = await fetch_all_standings(league_id)
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    _cache[key] = (now, raw)
-    return raw
-
-@app.post("/snapshot/{league_id}")
-async def snapshot_league(league_id: int, gw: Optional[int] = None):
-    try:
-        gw_id = gw or (await current_gw())
-        if not gw_id:
-            raise HTTPException(status_code=400, detail="Could not determine current GW")
-        data = await fetch_all_standings(league_id)
-        con = sqlite3.connect(DB_PATH)
-        cur = con.cursor()
-        cur.execute(
-            "INSERT OR IGNORE INTO league_snapshots (league_id, gw, taken_at, data) VALUES (?, ?, ?, ?)",
-            (league_id, gw_id, datetime.utcnow().isoformat(), json.dumps(data)),
-        )
-        con.commit()
-        con.close()
-        return {"ok": True, "league_id": league_id, "gw": gw_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return await fetch_all_standings(league_id)
 
 @app.post("/autosnapshot/{league_id}")
 async def autosnapshot(league_id: int):
-    """
-    Use FPL event-status to snapshot only when the current GW has settled (bonus added / leagues updated).
-    Safe to call repeatedly; DB UNIQUE(league_id, gw) prevents duplicates.
-    """
     try:
-        status = await fetch_event_status()
-        s = (status.get("status") or [{}])[0]
-        gw = s.get("event")
-        bonus_done = bool(s.get("bonus_added"))
-        if not gw:
-            raise HTTPException(status_code=503, detail="Could not determine current GW from event-status")
-        if not bonus_done:
-            return {"ok": False, "reason": "GW not settled yet", "gw": gw, "bonus_added": bonus_done}
-        data = await fetch_all_standings(league_id)
-        con = sqlite3.connect(DB_PATH)
-        cur = con.cursor()
-        cur.execute(
-            "INSERT OR IGNORE INTO league_snapshots (league_id, gw, taken_at, data) VALUES (?, ?, ?, ?)",
-            (league_id, gw, datetime.utcnow().isoformat(), json.dumps(data)),
-        )
-        con.commit()
-        con.close()
-        return {"ok": True, "snapshotted": True, "gw": gw, "bonus_added": bonus_done}
+        async def do_work():
+            status = await fetch_event_status()
+            s = (status.get("status") or [{}])[0]
+            gw = s.get("event")
+            bonus_done = bool(s.get("bonus_added"))
+            if not gw:
+                raise HTTPException(status_code=503, detail="Could not determine current GW")
+
+            fixtures = await fetch_fixtures_for_gw(gw)
+            all_done = fixtures_all_finished(fixtures)
+
+            bootstrap = await fetch_bootstrap()
+            events = bootstrap.get("events", [])
+            event_meta = next((e for e in events if e.get("id") == gw), None)
+            gw_finished = bool(event_meta and event_meta.get("finished"))
+
+            if not (bonus_done and all_done and gw_finished):
+                return {"ok": False, "gw": gw, "bonus_added": bonus_done, "fixtures_all_finished": all_done, "gw_finished_flag": gw_finished, "reason": "GW not fully over yet"}
+
+            data = await fetch_all_standings(league_id)
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cur.execute(
+                "INSERT OR IGNORE INTO league_snapshots (league_id, gw, taken_at, data) VALUES (?, ?, ?, ?)",
+                (league_id, gw, datetime.utcnow().isoformat(), json.dumps(data)),
+            )
+            con.commit()
+            con.close()
+            return {"ok": True, "snapshotted": True, "gw": gw}
+
+        return await asyncio.wait_for(do_work(), timeout=25.0)
+
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Upstream timeout (FPL API slow)")
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=e.response.status_code, detail=str(e))
     except Exception as e:
@@ -174,11 +146,8 @@ async def autosnapshot(league_id: int):
 async def list_history(league_id: int):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute(
-        "SELECT gw, taken_at FROM league_snapshots WHERE league_id=? ORDER BY gw",
-        (league_id,),
-    )
-    rows = [{"gw": gw, "taken_at": taken_at} for gw, taken_at in cur.fetchall()]
+    cur.execute("SELECT gw, taken_at FROM league_snapshots WHERE league_id=? ORDER BY gw", (league_id,))
+    rows = [{"gw": gw, "taken_at": taken} for gw, taken in cur.fetchall()]
     con.close()
     return {"league_id": league_id, "snapshots": rows}
 
@@ -186,10 +155,7 @@ async def list_history(league_id: int):
 async def get_snapshot(league_id: int, gw: int):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute(
-        "SELECT data FROM league_snapshots WHERE league_id=? AND gw=?",
-        (league_id, gw),
-    )
+    cur.execute("SELECT data FROM league_snapshots WHERE league_id=? AND gw=?", (league_id, gw))
     row = cur.fetchone()
     con.close()
     if not row:
