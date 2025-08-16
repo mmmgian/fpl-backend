@@ -208,3 +208,22 @@ async def get_team(entry_id: int):
         "gw": gw,
         "team": grouped,
     }
+    
+    @app.get("/bonus/{gw}")
+async def get_bonus_points(gw: int):
+    url = f"https://fantasy.premierleague.com/api/event/{gw}/live/"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        data = r.json()
+
+    # Extract bonus points per match
+    bonuses = []
+    for element in data["elements"]:
+        if element["stats"]["bonus"] > 0:
+            bonuses.append({
+                "player_id": element["id"],
+                "bonus": element["stats"]["bonus"]
+            })
+
+    return {"gameweek": gw, "bonuses": bonuses}
