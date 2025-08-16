@@ -208,8 +208,8 @@ async def get_team(entry_id: int):
         "gw": gw,
         "team": grouped,
     }
-    
-    @app.get("/bonus/{gw}")
+
+@app.get("/bonus/{gw}")
 async def get_bonus_points(gw: int):
     url = f"https://fantasy.premierleague.com/api/event/{gw}/live/"
     async with httpx.AsyncClient() as client:
