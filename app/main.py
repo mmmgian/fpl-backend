@@ -90,6 +90,10 @@ async def fetch_all_standings(league_id: int):
         page += 1
     return combined or {}
 
+async def fetch_entry_picks(entry_id: int, gw: int):
+    url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{gw}/picks/"
+    return await _get_json(url)
+
 # ---------- Routes ----------
 
 @app.get("/health")
@@ -161,3 +165,46 @@ async def get_snapshot(league_id: int, gw: int):
     if not row:
         raise HTTPException(status_code=404, detail="Snapshot not found")
     return json.loads(row[0])
+
+@app.get("/team/{entry_id}")
+async def get_team(entry_id: int):
+    # 1) get current GW and bootstrap lookup tables
+    bootstrap = await fetch_bootstrap()
+    events = bootstrap.get("events", [])
+    current = next((e for e in events if e.get("is_current")), None)
+    gw = current["id"] if current else max((e for e in events if e.get("finished")), key=lambda e: e["id"], default={}).get("id")
+    if not gw:
+        raise HTTPException(status_code=503, detail="Could not determine current GW")
+
+    elements = {e["id"]: e for e in bootstrap.get("elements", [])}
+    teams = {t["id"]: t for t in bootstrap.get("teams", [])}
+    pos_map = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+
+    # 2) fetch picks
+    data = await fetch_entry_picks(entry_id, gw)
+    picks = data.get("picks", [])
+
+    # 3) group by position
+    grouped = {"GK": [], "DEF": [], "MID": [], "FWD": []}
+    for p in picks:
+        el = elements.get(p.get("element"))
+        if not el:
+            continue
+        pos = pos_map.get(el.get("element_type"), "?")
+        team = teams.get(el.get("team"), {})
+        grouped[pos].append({
+            "name": f"{el.get('first_name', '')} {el.get('second_name', '')}".strip(),
+            "web_name": el.get("web_name"),
+            "team": team.get("short_name") or team.get("name"),
+            "now_cost": el.get("now_cost"),
+            "selected_by_percent": el.get("selected_by_percent"),
+            "is_captain": bool(p.get("is_captain")),
+            "is_vice_captain": bool(p.get("is_vice_captain")),
+            "multiplier": p.get("multiplier"),
+        })
+
+    return {
+        "entry_id": entry_id,
+        "gw": gw,
+        "team": grouped,
+    }
