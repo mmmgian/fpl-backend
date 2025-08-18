@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 DB_PATH = Path("snapshots.db")
+FPL_HEADERS = {"referer": "https://fantasy.premierleague.com/"}
 
 # ---------- DB init ----------
 def init_db():
@@ -188,6 +189,54 @@ async def get_history_gw(league_id: int, gw: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/tenure/{entry_id}")
+async def tenure(entry_id: int):
+    """
+    Returns how long an entry has played FPL, based on /api/entry/{id}/history/
+    Response:
+      {
+        "entry_id": 9264528,
+        "seasons_played": 9,
+        "first_season": "2016/17",
+        "playing_since_year": 2016,
+        "seasons": ["2016/17","2017/18", ...]
+      }
+    """
+    url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/history/"
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            r = await client.get(url, headers=FPL_HEADERS)
+            r.raise_for_status()
+            data = r.json()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail="Upstream error from FPL")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch tenure: {e}")
+
+    past = data.get("past") or []
+    # Collect season_name strings like "2016/17"
+    seasons = [p.get("season_name") for p in past if isinstance(p, dict) and p.get("season_name")]
+    seasons.sort()  # "YYYY/YY" sorts correctly for earliest first
+
+    seasons_played = len(seasons)
+    first_season = seasons[0] if seasons else None
+
+    # Safely parse the starting year from "YYYY/YY"
+    playing_since_year = None
+    if first_season and isinstance(first_season, str) and "/" in first_season:
+        try:
+            playing_since_year = int(first_season.split("/")[0])
+        except Exception:
+            playing_since_year = None
+
+    return {
+        "entry_id": entry_id,
+        "seasons_played": seasons_played,
+        "first_season": first_season,
+        "playing_since_year": playing_since_year,
+        "seasons": seasons,
+    }
+    
 @app.get("/team/{entry_id}")
 async def get_team(entry_id: int):
     # 1) get current GW and bootstrap lookup tables
