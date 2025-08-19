@@ -236,7 +236,7 @@ async def tenure(entry_id: int):
         "playing_since_year": playing_since_year,
         "seasons": seasons,
     }
-    
+
 @app.get("/team/{entry_id}")
 async def get_team(entry_id: int):
     # 1) get current GW and bootstrap lookup tables
@@ -298,3 +298,24 @@ async def get_bonus_points(gw: int):
             })
 
     return {"gameweek": gw, "bonuses": bonuses}
+
+    # --- Pass-through proxy endpoints for Nuxt ---
+
+@app.get("/bootstrap-static")
+async def proxy_bootstrap_static():
+    url = "https://fantasy.premierleague.com/api/bootstrap-static/"
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers={"referer": "https://fantasy.premierleague.com/"}) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        return r.json()
+
+@app.get("/fixtures")
+async def proxy_fixtures(event: int | None = None):
+    url = "https://fantasy.premierleague.com/api/fixtures/"
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers={"referer": "https://fantasy.premierleague.com/"}) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        data = r.json()
+    if event is not None:
+        data = [f for f in data if f.get("event") == event]
+    return data
