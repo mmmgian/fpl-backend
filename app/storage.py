@@ -61,9 +61,10 @@ class SnapshotRepository:
     def list(self, league_id: int) -> list[dict]:
         with closing(self._connect()) as con:
             rows = con.execute(
-                "SELECT gw, taken_at FROM league_snapshots WHERE league_id = ? ORDER BY gw ASC", (league_id,)
+                "SELECT gw, taken_at, json_extract(data, '$.reconstructed.gw') IS NOT NULL AS rebuilt "
+                "FROM league_snapshots WHERE league_id = ? ORDER BY gw ASC", (league_id,)
             ).fetchall()
-        return [{"gw": r["gw"], "taken_at": r["taken_at"]} for r in rows]
+        return [{"gw": r["gw"], "taken_at": r["taken_at"], "rebuilt": bool(r["rebuilt"])} for r in rows]
 
     def get(self, league_id: int, gw: int) -> StoredSnapshot | None:
         with closing(self._connect()) as con:

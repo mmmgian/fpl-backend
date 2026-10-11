@@ -262,6 +262,18 @@ def test_failures_are_not_cached(tmp_path):
     assert c.get("/bootstrap-static").status_code == 200
 
 
+def test_combined_pages_report_no_further_pages_once_everything_was_read():
+    """A merged table that still said has_next=True would make every consumer think it was incomplete."""
+    gw = FakeFpl({"/leagues-classic/1/standings/": standings_pages}).gateway()
+    assert asyncio.run(gw.standings(1))["standings"]["has_next"] is False
+
+
+def test_combined_pages_still_say_more_when_the_page_cap_cut_the_read_short():
+    never_ends = lambda params: {"league": {"id": 1}, "standings": {"has_next": True, "results": [{"entry": params["page_standings"]}]}}
+    merged = asyncio.run(FakeFpl({"/leagues-classic/1/standings/": never_ends}).gateway().standings(1))
+    assert merged["standings"]["has_next"] is True and len(merged["standings"]["results"]) > 1
+
+
 def test_standings_cache_is_not_mutated_by_combining_pages():
     fake = FakeFpl({"/leagues-classic/1/standings/": standings_pages})
     gw = fake.gateway()

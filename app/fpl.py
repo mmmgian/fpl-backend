@@ -144,7 +144,9 @@ class FplGateway:
         if len(pages) == 1:
             return first
         results = [row for p in pages for row in p.get("standings", {}).get("results", [])]
-        return {**first, "standings": {**first.get("standings", {}), "results": results}}
+        # has_next describes the LAST page fetched: false once everything was read, still true if the page cap cut us off.
+        more = bool(pages[-1].get("standings", {}).get("has_next"))
+        return {**first, "standings": {**first.get("standings", {}), "results": results, "has_next": more}}
 
     async def entry_history(self, entry_id: int) -> dict:
         return (await self._get(f"/entry/{entry_id}/history/", ttl=self._ttl.entry_history)).data

@@ -5,7 +5,7 @@ import asyncio
 import json
 from typing import Any
 
-from . import domain
+from . import backfill, domain
 from .fpl import FplGateway, FplResponse
 from .storage import SnapshotRepository
 
@@ -18,6 +18,22 @@ class NotReady(Exception):
 
 class TimedOut(Exception):
     """FPL was too slow to complete the use case."""
+
+
+class InvalidSnapshot(Exception):
+    """A table offered for import is malformed. `problems` says what is wrong."""
+
+    def __init__(self, problems: list[str]):
+        super().__init__("; ".join(problems))
+        self.problems = problems
+
+
+class NotFinished(Exception):
+    """The gameweek is not over and verified by FPL yet, so its table can still change."""
+
+
+class AlreadyStored(Exception):
+    """A snapshot for this league and gameweek exists. Imports never overwrite one."""
 
 
 class LeagueService:
@@ -49,6 +65,16 @@ class LeagueService:
         standings = await self._fpl.standings(league_id, fresh=True)
         stored = await asyncio.to_thread(self._snapshots.save, league_id, gw, standings)
         return {"ok": True, "snapshotted": stored, "already_existed": not stored, "gw": gw}
+
+    async def import_rebuilt(self, league_id: int, gw: int, data: Any) -> None:
+        """Store a table rebuilt after the fact (see backfill.py). Refuses anything unfinished, malformed or duplicate."""
+        problems = backfill.validate_snapshot_payload(league_id, gw, data)
+        if problems:
+            raise InvalidSnapshot(problems)
+        if gw not in backfill.finished_gameweeks((await self._fpl.bootstrap(fresh=True)).events):
+            raise NotFinished(f"GW{gw} is not finished and verified by FPL yet")
+        if not await asyncio.to_thread(self._snapshots.save, league_id, gw, data):
+            raise AlreadyStored(f"A snapshot for league {league_id}, GW{gw} already exists")
 
     # Synchronous (SQLite); the API layer runs these in a worker thread.
     def history(self, league_id: int) -> dict:
