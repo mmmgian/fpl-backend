@@ -24,6 +24,7 @@ class Settings:
     db_path: Path = Path("snapshots.db")
     allowed_origins: tuple[str, ...] = ("*",)
     snapshot_secret: str | None = None
+    self_heal: bool = True                       # rebuild missing history from FPL (see services.HistoryKeeper)
     cache_ttl: CacheTTL = field(default_factory=CacheTTL)
 
     @classmethod
@@ -35,4 +36,5 @@ class Settings:
             db_path=Path(e.get("DB_PATH", "snapshots.db")),
             allowed_origins=origins or ("*",),
             snapshot_secret=e.get("SNAPSHOT_SECRET") or None,
+            self_heal=e.get("SELF_HEAL_HISTORY", "1").strip().lower() not in ("0", "false", "no", "off"),
         )

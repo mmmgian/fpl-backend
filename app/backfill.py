@@ -40,6 +40,14 @@ def finished_gameweeks(events: list[dict]) -> list[int]:
     return sorted(e["id"] for e in events if e.get("finished") and e.get("data_checked"))
 
 
+def healable_gameweeks(events: list[dict], stored: set[int]) -> list[int]:
+    """Gameweeks a server with an empty or partial store should rebuild: finished and verified, not stored yet, and
+    not the current one. The current gameweek is left alone because `/autosnapshot` can still save FPL's own table
+    for it, and a stored snapshot is never overwritten, so a rebuilt copy saved first would shut that out for good."""
+    current = {e["id"] for e in events if e.get("is_current")}
+    return [gw for gw in finished_gameweeks(events) if gw not in stored and gw not in current]
+
+
 def _row_at(history: dict, gw: int) -> dict | None:
     return next((g for g in history.get("current", []) if g.get("event") == gw), None)
 

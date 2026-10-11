@@ -47,7 +47,7 @@ class FakeFpl:
 
 def make(tmp_path, routes=None, **env):
     fake = FakeFpl(routes or {})
-    settings = Settings.from_env({"DB_PATH": str(tmp_path / "test.db"), **env})
+    settings = Settings.from_env({"DB_PATH": str(tmp_path / "test.db"), "SELF_HEAL_HISTORY": "0", **env})   # off unless a test asks
     return TestClient(create_app(settings, fpl=fake.gateway())), fake
 
 

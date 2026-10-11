@@ -1,6 +1,7 @@
 """HTTP layer: routing, auth header, error mapping, CORS and compression. No business rules here."""
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 from contextlib import asynccontextmanager
@@ -12,7 +13,8 @@ from fastapi.responses import Response
 
 from .config import Settings
 from .fpl import FplGateway, Upstream
-from .services import AlreadyStored, GameweekService, InvalidSnapshot, LeagueService, NotFinished, NotReady, TeamService, TimedOut
+from .services import (AlreadyStored, GameweekService, HistoryKeeper, InvalidSnapshot, LeagueService, NotFinished, NotReady,
+                       TeamService, TimedOut)
 from .storage import SnapshotRepository
 
 
@@ -27,8 +29,8 @@ def json_bytes(body: bytes) -> Response:
 MAX_IMPORT_BYTES = 256 * 1024
 
 
-def create_app(settings: Settings, *, fpl: FplGateway | None = None,
-               snapshots: SnapshotRepository | None = None) -> FastAPI:
+def create_app(settings: Settings, *, fpl: FplGateway | None = None, snapshots: SnapshotRepository | None = None,
+               keeper: HistoryKeeper | None = None) -> FastAPI:
     fpl = fpl or FplGateway(settings.cache_ttl)
     snapshots = snapshots or SnapshotRepository(settings.db_path)
     snapshots.init()
@@ -36,13 +38,17 @@ def create_app(settings: Settings, *, fpl: FplGateway | None = None,
     leagues = LeagueService(fpl, snapshots)
     teams = TeamService(fpl)
     gameweeks = GameweekService(fpl)
+    keeper = keeper or HistoryKeeper(fpl, snapshots, settings.league_id)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        if settings.self_heal:
+            keeper.kick()           # a restart wiped the disk? start rebuilding before anyone asks
         yield
+        await keeper.stop()
         await fpl.aclose()
 
-    app = FastAPI(title="FPL League API", version="2.1.0", lifespan=lifespan)
+    app = FastAPI(title="FPL League API", version="2.2.0", lifespan=lifespan)
     origins = list(settings.allowed_origins)
     app.add_middleware(GZipMiddleware, minimum_size=1024)
     app.add_middleware(
@@ -77,14 +83,29 @@ def create_app(settings: Settings, *, fpl: FplGateway | None = None,
         except Upstream as e:
             raise upstream_error(e)
 
-    # Plain `def`: FastAPI runs these in its thread pool, keeping SQLite I/O off the event loop.
+    async def settle_history(league_id: int) -> set[int]:
+        """Gameweeks that are known to be missing and can't be supplied yet (none when self-healing is off)."""
+        return await keeper.settle(league_id) if settings.self_heal else set()
+
+    def rebuilding(missing: set[int]) -> HTTPException:
+        return HTTPException(status_code=503, headers={"Retry-After": "30"},
+                             detail=f"History is being rebuilt (GW {', '.join(map(str, sorted(missing)))}); try again shortly")
+
+    # SQLite I/O runs in a worker thread, off the event loop.
     @app.get("/history/{league_id}")
-    def get_history(league_id: int):
-        return leagues.history(league_id)
+    async def get_history(league_id: int):
+        # The frontend keeps a 200 list for a day, so an incomplete list is refused (503), never served.
+        if missing := await settle_history(league_id):
+            raise rebuilding(missing)
+        return await asyncio.to_thread(leagues.history, league_id)
 
     @app.get("/history/{league_id}/{gw}")
-    def get_history_gw(league_id: int, gw: int):
-        body = leagues.snapshot_json(league_id, gw)
+    async def get_history_gw(league_id: int, gw: int):
+        body = await asyncio.to_thread(leagues.snapshot_json, league_id, gw)
+        if body is None:
+            if gw in await settle_history(league_id):
+                raise rebuilding({gw})
+            body = await asyncio.to_thread(leagues.snapshot_json, league_id, gw)     # the rebuild may have just stored it
         if body is None:
             raise HTTPException(status_code=404, detail=f"No snapshot for league {league_id}, GW {gw}")
         return json_bytes(body)
